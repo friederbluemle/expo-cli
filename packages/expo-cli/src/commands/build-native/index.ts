@@ -1,54 +1,134 @@
 import { Platform } from '@expo/build-tools';
-import { getConfig } from '@expo/config';
-import { User, UserManager } from '@expo/xdl';
+import { ApiV2 } from '@expo/xdl';
 import { Command } from 'commander';
 
 import log from '../../log';
-import Builder, { BuilderContext } from './Builder';
+import { CredentialsSource } from '../../credentials/credentials';
+import { createBuilderContextAsync, startBuildAsync, waitForBuildEndAsync } from './build';
+import { AndroidBuilder } from './android';
+import { iOSBuilder } from './ios';
+import { EasJson, EasJsonReader } from './easJson';
 import { printBuildTable } from './utils';
 
-async function buildAction(
-  projectDir: string,
-  { platform }: { platform: Platform }
-): Promise<void> {
-  if (!platform || !Object.values(Platform).includes(platform)) {
-    throw new Error('Pass valid platform: [android|ios]');
-  }
-  const ctx = await createBuilderContextAsync(projectDir);
-  const builder = new Builder(ctx);
-  const buildArtifactUrl = await builder.buildProjectAsync(platform);
-  log(`Artifact url: ${buildArtifactUrl}`);
+interface AndroidGenericScopedOptions {
+  android: {
+    artifactPath: string;
+    buildCommand: string;
+  };
 }
-
-async function statusAction(projectDir: string): Promise<void> {
-  const ctx = await createBuilderContextAsync(projectDir);
-  const builder = new Builder(ctx);
-  const result = await builder.getLatestBuildsAsync();
-  printBuildTable(result.builds);
-}
-
-async function createBuilderContextAsync(projectDir: string): Promise<BuilderContext> {
-  const user: User = await UserManager.ensureLoggedInAsync();
-  const { exp } = getConfig(projectDir);
-  const accountName = exp.owner || user.username;
-  const projectName = exp.slug;
-  return {
-    projectDir,
-    user,
-    accountName,
-    projectName,
-    exp,
+interface AndroidManagedScopedOptions {
+  android: {
+    buildType: 'apk' | 'app-bundle';
   };
 }
 
+interface iOSManagedScopedOptions {
+  ios?: {
+    buildType: 'archive' | 'simulator';
+  };
+}
+
+interface Options {
+  platform: Platform | 'all';
+  credentialsSource?: CredentialsSource;
+  skipCredentialsCheck?: boolean;
+  wait?: boolean;
+}
+
+async function buildAction(projectDir: string, options: Options): Promise<void> {
+  const eas: EasJson = await new EasJsonReader(projectDir).withCliParams(options).read();
+
+  const ctx = await createBuilderContextAsync(projectDir, eas);
+  const client = ApiV2.clientForUser(ctx.user);
+  const scheduledBuilds: Array<{ platform: Platform; buildId: string }> = [];
+
+  if ([Platform.Android, 'all'].includes(options.platform)) {
+    const builder = new AndroidBuilder(ctx);
+    const buildId = await startBuildAsync(client, builder);
+    scheduledBuilds.push({ platform: Platform.Android, buildId });
+  }
+  if ([Platform.iOS, 'all'].includes(options.platform)) {
+    const builder = new iOSBuilder(ctx);
+    const buildId = await startBuildAsync(client, builder);
+    scheduledBuilds.push({ platform: Platform.iOS, buildId });
+  }
+
+  if (scheduledBuilds.length === 1) {
+    log(`Logs url: ${scheduledBuilds[0].buildId}`); // replace with logs url
+  } else {
+    scheduledBuilds.forEach(build => {
+      log(`Platform: ${build.platform}, Logs url: ${build.buildId}`); // replace with logs url
+    });
+  }
+  if (options.wait) {
+    const buildInfo = await waitForBuildEndAsync(
+      client,
+      ctx.projectId,
+      scheduledBuilds.map(i => i.buildId)
+    );
+    if (buildInfo.length === 1) {
+      log(`Artifact url: ${buildInfo[0]?.artifacts?.buildUrl ?? ''}`);
+    } else {
+      buildInfo.forEach(build => {
+        log(`Platform: ${build?.platform}, Artifact url: ${build?.artifacts?.buildUrl ?? ''}`);
+      });
+    }
+  }
+}
+
+async function statusAction(projectDir: string): Promise<void> {
+  throw new Error('not implemented yet');
+  // const ctx = await createBuilderContextAsync(projectDir);
+  // const result = await builder.getLatestBuildsAsync();
+  // printBuildTable(result.builds);
+}
+
+const appendHelpMessage = `  Options for android generic builds:
+
+    --build-command                   Name of the gradle task (defaults to ":app:assembleRelease")
+    --artifact-path                   Name of the gradle task (defaults to "android/app/build/outputs/apk/release/app-release.apk")
+
+  Options for android managed builds:
+
+    -t --build-type                   Type of build: [app-bundle|apk].
+
+  Options for ios managed builds:
+
+    -t --build-type                   Type of build: [archive|simulator].
+`;
+
 export default function (program: Command) {
-  program
+  const buildCmd = program
     .command('build [project-dir]')
     .description(
-      'Build an app binary for your project, signed and ready for submission to the Google Play Store / App Store.'
+      'Build an app binary for your project, signed and ready for submission to the Google Play Store.'
     )
-    .option('-p --platform <platform>', 'Platform: [android|ios]', /^(android|ios)$/i)
-    .asyncActionProjectDir(buildAction, { checkConfig: true });
+    .allowUnknownOption()
+    .option('-p --platform <platform>')
+    .option(
+      '-s --credentials-source <source>',
+      'sources: [local|remote|auto]',
+      /^(local|remote|auto)$/i
+    )
+    .option('--skip-credentials-check', 'Skip checking credentials', false)
+    .option('--no-wait', 'Exit immediately after triggering build.', false)
+    .asyncActionProjectDir(runBuildCmd, { checkConfig: true });
+
+  buildCmd.on('--help', () => {
+    console.log(appendHelpMessage);
+  });
+
+  // This function modifies Command object after --help flags was processed and
+  // runs parse on cli arguments once more. This we can have autogenerated help
+  // message and still use cli parser for options that need custom help output.
+  async function runBuildCmd(projectDir: string): Promise<void> {
+    const options = buildCmd
+      .option('--build-command <cmd>')
+      .option('--artifact-path <path>')
+      .option('-t --build-type <type>')
+      .parse(process.argv);
+    await buildAction(projectDir, options);
+  }
 
   program
     .command('build:status')
